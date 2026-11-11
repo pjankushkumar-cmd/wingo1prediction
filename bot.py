@@ -333,21 +333,73 @@ def parse_api_records(obj: Any) -> list[tuple[str, str]]:
 
 
 def fetch_api() -> list[tuple[str, str]]:
-    req = urllib.request.Request(
-        API_URL,
-        headers={
-            "User-Agent": "Mozilla/5.0 HACKII-Bot/1.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Referer": "https://draw.ar-lottery01.com/",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        raw = resp.read().decode("utf-8", "replace")
+    # Browser-style request headers can help when the API checks request metadata.
+    # They cannot override a server-side IP/network block imposed on Render.
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+        "Referer": "https://draw.ar-lottery01.com/",
+        "Origin": "https://draw.ar-lottery01.com",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+    }
+    # Optional cookie only if the API owner/provider supplies one for authorized use.
+    api_cookie = os.getenv("API_COOKIE", "").strip()
+    if api_cookie:
+        headers["Cookie"] = api_cookie
+
+    req = urllib.request.Request(API_URL, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        detail = e.read(800).decode("utf-8", "replace").replace("\\n", " ")
+        if e.code == 403:
+            raise RuntimeError(
+                "API returned HTTP 403 Forbidden. The API server is refusing "
+                "requests from this Render worker/network. Request headers cannot "
+                "guarantee a fix; ask the API provider to authorize/whitelist the "
+                "worker or provide an official server API. Response: " + detail[:300]
+            ) from e
+        raise RuntimeError(f"API HTTP {e.code}: {detail[:300]}") from e
+
     data = json.loads(raw)
     records = parse_api_records(data)
     if not records:
-        raise ValueError("Could not locate period/number fields in API JSON.")
+        raise ValueError(
+            "API responded, but period/number fields were not recognized. "
+            "Check the API JSON field names."
+        )
     return records
+
+
+def api_test_report() -> str:
+    """Run a one-shot API check from the Render worker and return a safe summary."""
+    try:
+        records = fetch_api()
+        records.sort(key=lambda x: int(re.sub(r"\\D", "", x[0]) or "0"), reverse=True)
+        period, number = records[0]
+        return (
+            "✅ <b>API reachable from Render</b>\\n"
+            f"Records parsed: <b>{len(records)}</b>\\n"
+            f"Latest period (last 4): <code>{display_period(period)}</code>\\n"
+            f"Latest number: <code>{number}</code>"
+        )
+    except Exception as exc:
+        msg = str(exc)
+        return (
+            "❌ <b>API check failed from Render</b>\\n"
+            f"<code>{msg[:900]}</code>\\n\\n"
+            "If the response is HTTP 403, the API provider/network is denying "
+            "the Render worker. Request authorized server access or an official "
+            "API endpoint from the provider; changing bot code cannot override "
+            "an upstream access denial."
+        )
 
 
 def next_period(period: str) -> str:
@@ -634,6 +686,9 @@ def process_admin_text(chat_id: int, text: str):
         send_message(chat_id, "✅ Sticker ID saved.")
     elif text == "/panel" or text == "/start":
         send_message(chat_id, panel_text(), admin_keyboard())
+    elif text == "/testapi":
+        send_message(chat_id, "⏳ Checking API from Render...")
+        send_message(chat_id, api_test_report())
     elif text == "/help":
         send_message(
             chat_id,
@@ -804,7 +859,12 @@ def api_loop():
                 if created:
                     log.info("Prediction created for period %s", display_period(target_period))
         except Exception as e:
-            log.warning("API polling error: %s", e)
+            message = str(e)
+            log.warning("API polling error: %s", message)
+            # Avoid flooding Render logs when the upstream API blocks the worker.
+            if "HTTP 403" in message:
+                time.sleep(30)
+                continue
         time.sleep(POLL_SECONDS)
 
 
