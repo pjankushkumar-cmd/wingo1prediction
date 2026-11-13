@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# HACKII WinGo Telegram Bot — single-file Render Background Worker
+# HACKII WinGo Telegram Bot — single-file Render Web Service
 # Python 3.11+
 #
 # Install:
 #   pip install cryptography
-# Run:
+# Render Web Service Start Command:
 #   python bot.py
+# Render will provide PORT automatically; this file serves /healthz.
 #
 # Required Render environment variables:
 #   BOT_TOKEN   = Telegram bot token
@@ -39,6 +40,7 @@ import secrets
 import random
 import logging
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -62,6 +64,8 @@ API_URL = os.getenv(
 POLL_SECONDS = max(1.0, float(os.getenv("POLL_SECONDS", "2")))
 DATA_DIR = os.getenv("DATA_DIR", ".").strip() or "."
 DB_PATH = os.path.join(DATA_DIR, "hackii_bot.sqlite3")
+PORT = int(os.getenv("PORT", "10000"))
+TELEGRAM_CONFLICT = threading.Event()
 
 if not BOT_TOKEN:
     raise SystemExit("Set BOT_TOKEN in Render Environment Variables.")
@@ -812,6 +816,14 @@ def telegram_loop():
                 except Exception:
                     log.exception("Update handling error")
         except Exception as e:
+            message = str(e)
+            if "HTTP 409" in message or "terminated by other getUpdates" in message:
+                log.critical(
+                    "Telegram polling stopped: another process is using getUpdates for this token. "
+                    "Stop every other service/device using this BOT_TOKEN."
+                )
+                TELEGRAM_CONFLICT.set()
+                return
             log.warning("Telegram polling error: %s", e)
             time.sleep(3)
 
@@ -868,9 +880,47 @@ def api_loop():
         time.sleep(POLL_SECONDS)
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/healthz"):
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"Not found")
+            return
+        body = json.dumps({
+            "ok": True,
+            "service": "hackii-wingo-bot",
+            "telegram_polling_conflict": TELEGRAM_CONFLICT.is_set(),
+        }).encode("utf-8")
+        self.send_response(503 if TELEGRAM_CONFLICT.is_set() else 200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        log.info("HTTP %s - %s", self.address_string(), fmt % args)
+
+
+def acquire_single_instance_lock():
+    # Prevent duplicate processes that share the same DATA_DIR/disk.
+    try:
+        import fcntl
+        lock_path = os.path.join(DATA_DIR, "hackii_bot.lock")
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_file  # Keep the descriptor alive for the process lifetime.
+    except ImportError:
+        log.warning("OS file locking is unavailable; set Render Instances to 1.")
+        return None
+    except BlockingIOError:
+        raise SystemExit("Another bot process is already running with this DATA_DIR.")
+
+
 def main():
     init_db()
-    log.info("HACKII WinGo bot starting.")
+    lock_file = acquire_single_instance_lock()
+    log.info("HACKII WinGo bot starting as a Render Web Service.")
     try:
         me = tg("getMe", {})
         log.info("Telegram bot connected: @%s", me.get("username"))
@@ -881,8 +931,14 @@ def main():
     t2 = threading.Thread(target=api_loop, name="api-poll", daemon=True)
     t1.start()
     t2.start()
-    while True:
-        time.sleep(60)
+
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.daemon_threads = True
+    log.info("Health server listening on 0.0.0.0:%s (GET /healthz)", PORT)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
